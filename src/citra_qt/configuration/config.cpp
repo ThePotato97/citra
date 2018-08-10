@@ -100,6 +100,8 @@ void Config::ReadValues() {
     Settings::values.bg_red = ReadSetting("bg_red", 0.0).toFloat();
     Settings::values.bg_green = ReadSetting("bg_green", 0.0).toFloat();
     Settings::values.bg_blue = ReadSetting("bg_blue", 0.0).toFloat();
+	Settings::values.tex_filter = qt_config->value("tex_filter", 0).toInt();
+	Settings::values.tex_filter_scaling = qt_config->value("tex_filter_scaling", 1).toInt();
     qt_config->endGroup();
 
     qt_config->beginGroup("Layout");
@@ -331,6 +333,8 @@ void Config::SaveValues() {
     WriteSetting("bg_red", (double)Settings::values.bg_red, 0.0);
     WriteSetting("bg_green", (double)Settings::values.bg_green, 0.0);
     WriteSetting("bg_blue", (double)Settings::values.bg_blue, 0.0);
+	qt_config->setValue("tex_filter", Settings::values.tex_filter);
+	qt_config->setValue("tex_filter_scaling", Settings::values.tex_filter_scaling);
     qt_config->endGroup();
 
     qt_config->beginGroup("Layout");

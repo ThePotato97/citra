@@ -71,6 +71,8 @@ add_library(video_core STATIC
     vertex_loader.h
     video_core.cpp
     video_core.h
+	filtering/texture_filterer.cpp
+    filtering/xbrz/xbrz.cpp
 )
 
 if(ARCHITECTURE_x86_64)

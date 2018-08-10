@@ -31,6 +31,8 @@ void Apply() {
         VideoCore::g_emu_window->UpdateCurrentFramebufferLayout(layout.width, layout.height);
     }
 
+	VideoCore::g_is_rasterizer_dirty = true;
+
     VideoCore::g_renderer_bg_color_update_requested = true;
 
     if (Core::System::GetInstance().IsPoweredOn()) {

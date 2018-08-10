@@ -31,6 +31,8 @@
 #include "video_core/utils.h"
 #include "video_core/video_core.h"
 
+#include "video_core/filtering/texture_filterer.h"
+
 using SurfaceType = SurfaceParams::SurfaceType;
 using PixelFormat = SurfaceParams::PixelFormat;
 
@@ -626,6 +628,8 @@ MICROPROFILE_DEFINE(OpenGL_SurfaceLoad, "OpenGL", "Surface Load", MP_RGB(128, 64
 void CachedSurface::LoadGLBuffer(PAddr load_start, PAddr load_end) {
     ASSERT(type != SurfaceType::Fill);
 
+	bool ignore_scaling = false;
+
     const u8* const texture_src_data = Memory::GetPhysicalPointer(addr);
     if (texture_src_data == nullptr)
         return;
@@ -634,6 +638,7 @@ void CachedSurface::LoadGLBuffer(PAddr load_start, PAddr load_end) {
         gl_buffer_size = width * height * GetGLBytesPerPixel(pixel_format);
         gl_buffer.reset(new u8[gl_buffer_size]);
     }
+
 
     // TODO: Should probably be done in ::Memory:: and check for other regions too
     if (load_start < Memory::VRAM_VADDR_END && load_end > Memory::VRAM_VADDR_END)
@@ -656,9 +661,13 @@ void CachedSurface::LoadGLBuffer(PAddr load_start, PAddr load_end) {
             Pica::Texture::TextureInfo tex_info{};
             tex_info.width = width;
             tex_info.height = height;
-            tex_info.format = static_cast<Pica::TexturingRegs::TextureFormat>(pixel_format);
+            tex_info.format = (Pica::TexturingRegs::TextureFormat)(pixel_format);
             tex_info.SetDefaultStride();
             tex_info.physical_address = addr;
+
+			const FormatTuple& tuple = GetFormatTuple(pixel_format);
+
+			std::vector<Math::Vec4<u8>> tex_buffer(tex_info.width * tex_info.height);
 
             const SurfaceInterval load_interval(load_start, load_end);
             const auto rect = GetSubRect(FromInterval(load_interval));
@@ -672,6 +681,26 @@ void CachedSurface::LoadGLBuffer(PAddr load_start, PAddr load_end) {
                     std::memcpy(&gl_buffer[offset], vec4.AsArray(), 4);
                 }
             }
+
+
+			if (Filtering::isScalingEnabled() && !ignore_scaling) {
+				0, GL_RGBA, GL_UNSIGNED_BYTE, tex_buffer.data();
+				int scaling = Filtering::getScaling();
+				std::vector<Math::Vec4<u8>> tex_buffer_scaled(Filtering::getScaledTextureSize(
+					tex_info.format, tex_info.width, tex_info.height));
+				Filtering::filterTexture(tex_info, (unsigned int*)tex_buffer.data(),
+					(unsigned int*)tex_buffer_scaled.data());
+				glTexImage2D(GL_TEXTURE_2D, 0, tuple.internal_format,
+					tex_info.width * scaling,
+					tex_info.height * scaling, 0, GL_RGBA,
+					GL_UNSIGNED_BYTE, tex_buffer_scaled.data());
+			}
+			else {
+				glTexImage2D(GL_TEXTURE_2D, 0, tuple.internal_format, tex_info.width,
+					tex_info.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, tex_buffer.data());
+			}
+
+
         } else {
             morton_to_gl_fns[static_cast<size_t>(pixel_format)](stride, height, &gl_buffer[0], addr,
                                                                 load_start, load_end);
@@ -723,6 +752,8 @@ void CachedSurface::FlushGLBuffer(PAddr flush_start, PAddr flush_end) {
                                                             flush_start, flush_end);
     }
 }
+
+
 
 MICROPROFILE_DEFINE(OpenGL_TextureUL, "OpenGL", "Texture Upload", MP_RGB(128, 64, 192));
 void CachedSurface::UploadGLTexture(const MathUtil::Rectangle<u32>& rect, GLuint read_fb_handle,
@@ -804,13 +835,14 @@ void CachedSurface::DownloadGLTexture(const MathUtil::Rectangle<u32>& rect, GLui
     OpenGLState state = OpenGLState::GetCurState();
     OpenGLState prev_state = state;
     SCOPE_EXIT({ prev_state.Apply(); });
-
+	CachedSurface* best_subrect_surface = nullptr;
     const FormatTuple& tuple = GetFormatTuple(pixel_format);
 
     // Ensure no bad interactions with GL_PACK_ALIGNMENT
     ASSERT(stride * GetGLBytesPerPixel(pixel_format) % 4 == 0);
     glPixelStorei(GL_PACK_ROW_LENGTH, static_cast<GLint>(stride));
     size_t buffer_offset = (rect.bottom * stride + rect.left) * GetGLBytesPerPixel(pixel_format);
+
 
     // If not 1x scale, blit scaled texture to a new 1x texture and use that to flush
     if (res_scale != 1) {

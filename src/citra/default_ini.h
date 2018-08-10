@@ -81,6 +81,15 @@ use_hw_renderer =
 # 0: Software, 1 (default): Hardware
 use_hw_shader =
 
+
+# What texture filter to use
+# 0 (default): Nothing, 1: xbRZ
+tex_filter =
+# What texture filtering size to use (if enabled)
+# 1 (default): Disabled, 2-6: Enabled at x times scaling
+tex_filter_scaling =
+
+
 # Whether to use accurate multiplication in hardware shaders
 # 0: Off (Default. Faster, but causes issues in some games) 1: On (Slower, but correct)
 shaders_accurate_mul =
