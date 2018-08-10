@@ -6,6 +6,7 @@
 
 #include <array>
 #include <string>
+#include <unordered_map>
 #include "common/common_types.h"
 #include "core/hle/service/cam/cam.h"
 
@@ -95,6 +96,8 @@ struct Values {
     std::array<std::string, NativeAnalog::NumAnalogs> analogs;
     std::string motion_device;
     std::string touch_device;
+    std::string udp_input_address;
+    u16 udp_input_port;
 
     // Core
     bool use_cpu_jit;
@@ -154,6 +157,7 @@ struct Values {
     bool use_gdbstub;
     u16 gdbstub_port;
     std::string log_filter;
+    std::unordered_map<std::string, bool> lle_modules;
 
     // Movie
     std::string movie_play;

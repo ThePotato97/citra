@@ -2,39 +2,98 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <cryptopp/aes.h>
+#include <cryptopp/modes.h>
+#include "core/file_sys/archive_ncch.h"
+#include "core/file_sys/file_backend.h"
 #include "core/hle/ipc_helpers.h"
 #include "core/hle/kernel/ipc.h"
+#include "core/hle/romfs.h"
+#include "core/hle/service/fs/archive.h"
 #include "core/hle/service/http_c.h"
+#include "core/hw/aes/key.h"
 
 namespace Service {
 namespace HTTP {
 
 namespace ErrCodes {
 enum {
+    InvalidRequestState = 22,
+    TooManyContexts = 26,
     InvalidRequestMethod = 32,
-    InvalidContext = 102,
+    ContextNotFound = 100,
+
+    /// This error is returned in multiple situations: when trying to initialize an
+    /// already-initialized session, or when using the wrong context handle in a context-bound
+    /// session
+    SessionStateError = 102,
 };
 }
 
-const ResultCode ERROR_CONTEXT_ERROR = // 0xD8A0A066
-    ResultCode(ErrCodes::InvalidContext, ErrorModule::HTTP, ErrorSummary::InvalidState,
+const ResultCode ERROR_STATE_ERROR = // 0xD8A0A066
+    ResultCode(ErrCodes::SessionStateError, ErrorModule::HTTP, ErrorSummary::InvalidState,
                ErrorLevel::Permanent);
 
 void HTTP_C::Initialize(Kernel::HLERequestContext& ctx) {
     IPC::RequestParser rp(ctx, 0x1, 1, 4);
     const u32 shmem_size = rp.Pop<u32>();
-    rp.PopPID();
+    u32 pid = rp.PopPID();
     shared_memory = rp.PopObject<Kernel::SharedMemory>();
     if (shared_memory) {
         shared_memory->name = "HTTP_C:shared_memory";
     }
 
+    LOG_WARNING(Service_HTTP, "(STUBBED) called, shared memory size: {} pid: {}", shmem_size, pid);
+
+    auto* session_data = GetSessionData(ctx.Session());
+    ASSERT(session_data);
+
+    if (session_data->initialized) {
+        LOG_ERROR(Service_HTTP, "Tried to initialize an already initialized session");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ERROR_STATE_ERROR);
+        return;
+    }
+
+    session_data->initialized = true;
+
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     // This returns 0xd8a0a046 if no network connection is available.
     // Just assume we are always connected.
     rb.Push(RESULT_SUCCESS);
+}
 
-    LOG_WARNING(Service_HTTP, "(STUBBED) called, shared memory size: {}", shmem_size);
+void HTTP_C::InitializeConnectionSession(Kernel::HLERequestContext& ctx) {
+    IPC::RequestParser rp(ctx, 0x8, 1, 2);
+    const Context::Handle context_handle = rp.Pop<u32>();
+    u32 pid = rp.PopPID();
+
+    auto* session_data = GetSessionData(ctx.Session());
+    ASSERT(session_data);
+
+    if (session_data->initialized) {
+        LOG_ERROR(Service_HTTP, "Tried to initialize an already initialized session");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ERROR_STATE_ERROR);
+        return;
+    }
+
+    // TODO(Subv): Check that the input PID matches the PID that created the context.
+    auto itr = contexts.find(context_handle);
+    if (itr == contexts.end()) {
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ResultCode(ErrCodes::ContextNotFound, ErrorModule::HTTP, ErrorSummary::InvalidState,
+                           ErrorLevel::Permanent));
+        return;
+    }
+
+    session_data->initialized = true;
+    // Bind the context to the current session.
+    session_data->current_http_context = context_handle;
+
+    IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+    rb.Push(RESULT_SUCCESS);
+    LOG_DEBUG(Service_HTTP, "called, context_id={} pid={}", context_handle, pid);
 }
 
 void HTTP_C::CreateContext(Kernel::HLERequestContext& ctx) {
@@ -50,11 +109,46 @@ void HTTP_C::CreateContext(Kernel::HLERequestContext& ctx) {
     LOG_DEBUG(Service_HTTP, "called, url_size={}, url={}, method={}", url_size, url,
               static_cast<u32>(method));
 
+    auto* session_data = GetSessionData(ctx.Session());
+    ASSERT(session_data);
+
+    if (!session_data->initialized) {
+        LOG_ERROR(Service_HTTP, "Tried to create a context on an uninitialized session");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ERROR_STATE_ERROR);
+        rb.PushMappedBuffer(buffer);
+        return;
+    }
+
+    // This command can only be called without a bound session.
+    if (session_data->current_http_context != boost::none) {
+        LOG_ERROR(Service_HTTP, "Command called with a bound context");
+
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ResultCode(ErrorDescription::NotImplemented, ErrorModule::HTTP,
+                           ErrorSummary::Internal, ErrorLevel::Permanent));
+        rb.PushMappedBuffer(buffer);
+        return;
+    }
+
+    static constexpr size_t MaxConcurrentHTTPContexts = 8;
+    if (session_data->num_http_contexts >= MaxConcurrentHTTPContexts) {
+        // There can only be 8 HTTP contexts open at the same time for any particular session.
+        LOG_ERROR(Service_HTTP, "Tried to open too many HTTP contexts");
+
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ResultCode(ErrCodes::TooManyContexts, ErrorModule::HTTP, ErrorSummary::InvalidState,
+                           ErrorLevel::Permanent));
+        rb.PushMappedBuffer(buffer);
+        return;
+    }
+
     if (method == RequestMethod::None || static_cast<u32>(method) >= TotalRequestMethods) {
         LOG_ERROR(Service_HTTP, "invalid request method={}", static_cast<u32>(method));
 
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
-        rb.Push(ERROR_CONTEXT_ERROR);
+        rb.Push(ResultCode(ErrCodes::InvalidRequestMethod, ErrorModule::HTTP,
+                           ErrorSummary::InvalidState, ErrorLevel::Permanent));
         rb.PushMappedBuffer(buffer);
         return;
     }
@@ -66,6 +160,8 @@ void HTTP_C::CreateContext(Kernel::HLERequestContext& ctx) {
     // TODO(Subv): Find a correct default value for this field.
     contexts[context_counter].socket_buffer_size = 0;
     contexts[context_counter].handle = context_counter;
+
+    session_data->num_http_contexts++;
 
     IPC::RequestBuilder rb = rp.MakeBuilder(2, 2);
     rb.Push(RESULT_SUCCESS);
@@ -80,10 +176,24 @@ void HTTP_C::CloseContext(Kernel::HLERequestContext& ctx) {
 
     LOG_WARNING(Service_HTTP, "(STUBBED) called, handle={}", context_handle);
 
+    auto* session_data = GetSessionData(ctx.Session());
+    ASSERT(session_data);
+
+    if (!session_data->initialized) {
+        LOG_ERROR(Service_HTTP, "Tried to close a context on an uninitialized session");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
+        rb.Push(ERROR_STATE_ERROR);
+        return;
+    }
+
+    ASSERT_MSG(session_data->current_http_context == boost::none,
+               "Unimplemented CloseContext on context-bound session");
+
     auto itr = contexts.find(context_handle);
     if (itr == contexts.end()) {
+        // The real HTTP module just silently fails in this case.
         IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(ERROR_CONTEXT_ERROR);
+        rb.Push(RESULT_SUCCESS);
         LOG_ERROR(Service_HTTP, "called, context {} not found", context_handle);
         return;
     }
@@ -91,7 +201,10 @@ void HTTP_C::CloseContext(Kernel::HLERequestContext& ctx) {
     // TODO(Subv): What happens if you try to close a context that's currently being used?
     ASSERT(itr->second.state == RequestState::NotStarted);
 
+    // TODO(Subv): Make sure that only the session that created the context can close it.
+
     contexts.erase(itr);
+    session_data->num_http_contexts--;
 
     IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
     rb.Push(RESULT_SUCCESS);
@@ -108,19 +221,56 @@ void HTTP_C::AddRequestHeader(Kernel::HLERequestContext& ctx) {
     // Copy the name_buffer into a string without the \0 at the end
     const std::string name(name_buffer.begin(), name_buffer.end() - 1);
 
-    // Copy thr value_buffer into a string without the \0 at the end
+    // Copy the value_buffer into a string without the \0 at the end
     std::string value(value_size - 1, '\0');
     value_buffer.Read(&value[0], 0, value_size - 1);
 
-    auto itr = contexts.find(context_handle);
-    if (itr == contexts.end()) {
-        IPC::RequestBuilder rb = rp.MakeBuilder(1, 0);
-        rb.Push(ERROR_CONTEXT_ERROR);
-        LOG_ERROR(Service_HTTP, "called, context {} not found", context_handle);
+    auto* session_data = GetSessionData(ctx.Session());
+    ASSERT(session_data);
+
+    if (!session_data->initialized) {
+        LOG_ERROR(Service_HTTP, "Tried to add a request header on an uninitialized session");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ERROR_STATE_ERROR);
+        rb.PushMappedBuffer(value_buffer);
         return;
     }
 
-    ASSERT(itr->second.state == RequestState::NotStarted);
+    // This command can only be called with a bound context
+    if (session_data->current_http_context == boost::none) {
+        LOG_ERROR(Service_HTTP, "Command called without a bound context");
+
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ResultCode(ErrorDescription::NotImplemented, ErrorModule::HTTP,
+                           ErrorSummary::Internal, ErrorLevel::Permanent));
+        rb.PushMappedBuffer(value_buffer);
+        return;
+    }
+
+    if (session_data->current_http_context != context_handle) {
+        LOG_ERROR(Service_HTTP,
+                  "Tried to add a request header on a mismatched session input context={} session "
+                  "context={}",
+                  context_handle, session_data->current_http_context.get());
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ERROR_STATE_ERROR);
+        rb.PushMappedBuffer(value_buffer);
+        return;
+    }
+
+    auto itr = contexts.find(context_handle);
+    ASSERT(itr != contexts.end());
+
+    if (itr->second.state != RequestState::NotStarted) {
+        LOG_ERROR(Service_HTTP,
+                  "Tried to add a request header on a context that has already been started.");
+        IPC::RequestBuilder rb = rp.MakeBuilder(1, 2);
+        rb.Push(ResultCode(ErrCodes::InvalidRequestState, ErrorModule::HTTP,
+                           ErrorSummary::InvalidState, ErrorLevel::Permanent));
+        rb.PushMappedBuffer(value_buffer);
+        return;
+    }
+
     ASSERT(std::find_if(itr->second.headers.begin(), itr->second.headers.end(),
                         [&name](const Context::RequestHeader& m) -> bool {
                             return m.name == name;
@@ -132,8 +282,89 @@ void HTTP_C::AddRequestHeader(Kernel::HLERequestContext& ctx) {
     rb.Push(RESULT_SUCCESS);
     rb.PushMappedBuffer(value_buffer);
 
-    LOG_WARNING(Service_HTTP, "called, name={}, value={}, context_handle={}", name, value,
-                context_handle);
+    LOG_DEBUG(Service_HTTP, "called, name={}, value={}, context_handle={}", name, value,
+              context_handle);
+}
+
+void HTTP_C::DecryptClCertA() {
+    static constexpr u32 iv_length = 16;
+
+    FileSys::Path archive_path =
+        FileSys::MakeNCCHArchivePath(0x0004001b00010002, Service::FS::MediaType::NAND);
+    auto archive_result = Service::FS::OpenArchive(Service::FS::ArchiveIdCode::NCCH, archive_path);
+    if (archive_result.Failed()) {
+        LOG_ERROR(Service_HTTP, "ClCertA archive missing");
+        return;
+    }
+
+    std::array<char, 8> exefs_filepath;
+    FileSys::Path file_path = FileSys::MakeNCCHFilePath(
+        FileSys::NCCHFileOpenType::NCCHData, 0, FileSys::NCCHFilePathType::RomFS, exefs_filepath);
+    FileSys::Mode open_mode = {};
+    open_mode.read_flag.Assign(1);
+    auto file_result = Service::FS::OpenFileFromArchive(*archive_result, file_path, open_mode);
+    if (file_result.Failed()) {
+        LOG_ERROR(Service_HTTP, "ClCertA file missing");
+        return;
+    }
+
+    auto romfs = std::move(file_result).Unwrap();
+    std::vector<u8> romfs_buffer(romfs->backend->GetSize());
+    romfs->backend->Read(0, romfs_buffer.size(), romfs_buffer.data());
+    romfs->backend->Close();
+
+    if (!HW::AES::IsNormalKeyAvailable(HW::AES::KeySlotID::SSLKey)) {
+        LOG_ERROR(Service_HTTP, "NormalKey in KeySlot 0x0D missing");
+        return;
+    }
+    HW::AES::AESKey key = HW::AES::GetNormalKey(HW::AES::KeySlotID::SSLKey);
+
+    const RomFS::RomFSFile cert_file =
+        RomFS::GetFile(romfs_buffer.data(), {u"ctr-common-1-cert.bin"});
+    if (cert_file.Length() == 0) {
+        LOG_ERROR(Service_HTTP, "ctr-common-1-cert.bin missing");
+        return;
+    }
+    if (cert_file.Length() <= iv_length) {
+        LOG_ERROR(Service_HTTP, "ctr-common-1-cert.bin size is too small. Size: {}",
+                  cert_file.Length());
+        return;
+    }
+
+    std::vector<u8> cert_data(cert_file.Length() - iv_length);
+
+    using CryptoPP::AES;
+    CryptoPP::CBC_Mode<AES>::Decryption aes_cert;
+    std::array<u8, iv_length> cert_iv;
+    std::memcpy(cert_iv.data(), cert_file.Data(), iv_length);
+    aes_cert.SetKeyWithIV(key.data(), AES::BLOCKSIZE, cert_iv.data());
+    aes_cert.ProcessData(cert_data.data(), cert_file.Data() + iv_length,
+                         cert_file.Length() - iv_length);
+
+    const RomFS::RomFSFile key_file =
+        RomFS::GetFile(romfs_buffer.data(), {u"ctr-common-1-key.bin"});
+    if (key_file.Length() == 0) {
+        LOG_ERROR(Service_HTTP, "ctr-common-1-key.bin missing");
+        return;
+    }
+    if (key_file.Length() <= iv_length) {
+        LOG_ERROR(Service_HTTP, "ctr-common-1-key.bin size is too small. Size: {}",
+                  key_file.Length());
+        return;
+    }
+
+    std::vector<u8> key_data(key_file.Length() - iv_length);
+
+    CryptoPP::CBC_Mode<AES>::Decryption aes_key;
+    std::array<u8, iv_length> key_iv;
+    std::memcpy(key_iv.data(), key_file.Data(), iv_length);
+    aes_key.SetKeyWithIV(key.data(), AES::BLOCKSIZE, key_iv.data());
+    aes_key.ProcessData(key_data.data(), key_file.Data() + iv_length,
+                        key_file.Length() - iv_length);
+
+    ClCertA.certificate = std::move(cert_data);
+    ClCertA.private_key = std::move(key_data);
+    ClCertA.init = true;
 }
 
 HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
@@ -145,7 +376,7 @@ HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
         {0x00050040, nullptr, "GetRequestState"},
         {0x00060040, nullptr, "GetDownloadSizeState"},
         {0x00070040, nullptr, "GetRequestError"},
-        {0x00080042, nullptr, "InitializeConnectionSession"},
+        {0x00080042, &HTTP_C::InitializeConnectionSession, "InitializeConnectionSession"},
         {0x00090040, nullptr, "BeginRequest"},
         {0x000A0040, nullptr, "BeginRequestAsync"},
         {0x000B0082, nullptr, "ReceiveData"},
@@ -196,6 +427,8 @@ HTTP_C::HTTP_C() : ServiceFramework("http:C", 32) {
         {0x00390000, nullptr, "Finalize"},
     };
     RegisterHandlers(functions);
+
+    DecryptClCertA();
 }
 
 void InstallInterfaces(SM::ServiceManager& service_manager) {

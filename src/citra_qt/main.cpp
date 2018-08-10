@@ -30,6 +30,7 @@
 #include "citra_qt/debugger/graphics/graphics_surface.h"
 #include "citra_qt/debugger/graphics/graphics_tracing.h"
 #include "citra_qt/debugger/graphics/graphics_vertex_shader.h"
+#include "citra_qt/debugger/lle_service_modules.h"
 #include "citra_qt/debugger/profiler.h"
 #include "citra_qt/debugger/registers.h"
 #include "citra_qt/debugger/wait_tree.h"
@@ -108,6 +109,8 @@ void GMainWindow::ShowCallouts() {
            "more</a>");
     ShowCalloutMessage(telemetry_message, CalloutFlag::Telemetry);
 }
+
+const int GMainWindow::max_recent_files_item;
 
 GMainWindow::GMainWindow() : config(new Config()), emu_thread(nullptr) {
     Log::Filter log_filter;
@@ -302,6 +305,15 @@ void GMainWindow::InitializeDebugWidgets() {
             &WaitTreeWidget::OnEmulationStarting);
     connect(this, &GMainWindow::EmulationStopping, waitTreeWidget,
             &WaitTreeWidget::OnEmulationStopping);
+
+    lleServiceModulesWidget = new LLEServiceModulesWidget(this);
+    addDockWidget(Qt::RightDockWidgetArea, lleServiceModulesWidget);
+    lleServiceModulesWidget->hide();
+    debug_menu->addAction(lleServiceModulesWidget->toggleViewAction());
+    connect(this, &GMainWindow::EmulationStarting,
+            [this] { lleServiceModulesWidget->setDisabled(true); });
+    connect(this, &GMainWindow::EmulationStopping, waitTreeWidget,
+            [this] { lleServiceModulesWidget->setDisabled(false); });
 }
 
 void GMainWindow::InitializeRecentFileMenuActions() {
@@ -312,6 +324,14 @@ void GMainWindow::InitializeRecentFileMenuActions() {
 
         ui.menu_recent_files->addAction(actions_recent_files[i]);
     }
+    ui.menu_recent_files->addSeparator();
+    QAction* action_clear_recent_files = new QAction(this);
+    action_clear_recent_files->setText(tr("Clear Recent Files"));
+    connect(action_clear_recent_files, &QAction::triggered, this, [this] {
+        UISettings::values.recent_files.clear();
+        UpdateRecentFiles();
+    });
+    ui.menu_recent_files->addAction(action_clear_recent_files);
 
     UpdateRecentFiles();
 }
@@ -347,10 +367,10 @@ void GMainWindow::InitializeHotkeys() {
             }
         }
     });
-    connect(GetHotkey("Main Window", "Restart", this), &QShortcut::activated, this, [&] {
+    connect(GetHotkey("Main Window", "Restart", this), &QShortcut::activated, this, [this] {
         if (!Core::System::GetInstance().IsPoweredOn())
             return;
-        BootGame(QString(UISettings::values.recent_files.first()));
+        BootGame(QString(game_path));
     });
     connect(GetHotkey("Main Window", "Swap Screens", render_window), &QShortcut::activated,
             ui.action_Screen_Layout_Swap_Screens, &QAction::trigger);
@@ -468,8 +488,7 @@ void GMainWindow::ConnectMenuEvents() {
     connect(ui.action_Start, &QAction::triggered, this, &GMainWindow::OnStartGame);
     connect(ui.action_Pause, &QAction::triggered, this, &GMainWindow::OnPauseGame);
     connect(ui.action_Stop, &QAction::triggered, this, &GMainWindow::OnStopGame);
-    connect(ui.action_Restart, &QAction::triggered, this,
-            [&] { BootGame(QString(UISettings::values.recent_files.first())); });
+    connect(ui.action_Restart, &QAction::triggered, this, [this] { BootGame(QString(game_path)); });
     connect(ui.action_Report_Compatibility, &QAction::triggered, this,
             &GMainWindow::OnMenuReportCompatibility);
     connect(ui.action_Configure, &QAction::triggered, this, &GMainWindow::OnConfigure);
@@ -687,6 +706,8 @@ bool GMainWindow::LoadROM(const QString& filename) {
     game_title = QString::fromStdString(title);
     SetupUIStrings();
 
+    game_path = filename;
+
     Core::Telemetry().AddField(Telemetry::FieldType::App, "Frontend", "Qt");
     return true;
 }
@@ -784,6 +805,8 @@ void GMainWindow::ShutdownGame() {
 
     game_title.clear();
     SetupUIStrings();
+
+    game_path.clear();
 }
 
 void GMainWindow::StoreRecentFile(const QString& filename) {
@@ -797,11 +820,11 @@ void GMainWindow::StoreRecentFile(const QString& filename) {
 }
 
 void GMainWindow::UpdateRecentFiles() {
-    unsigned int num_recent_files =
-        std::min(UISettings::values.recent_files.size(), static_cast<int>(max_recent_files_item));
+    const int num_recent_files =
+        std::min(UISettings::values.recent_files.size(), max_recent_files_item);
 
-    for (unsigned int i = 0; i < num_recent_files; i++) {
-        QString text = QString("&%1. %2").arg(i + 1).arg(
+    for (int i = 0; i < num_recent_files; i++) {
+        const QString text = QString("&%1. %2").arg(i + 1).arg(
             QFileInfo(UISettings::values.recent_files[i]).fileName());
         actions_recent_files[i]->setText(text);
         actions_recent_files[i]->setData(UISettings::values.recent_files[i]);
@@ -813,12 +836,8 @@ void GMainWindow::UpdateRecentFiles() {
         actions_recent_files[j]->setVisible(false);
     }
 
-    // Grey out the recent files menu if the list is empty
-    if (num_recent_files == 0) {
-        ui.menu_recent_files->setEnabled(false);
-    } else {
-        ui.menu_recent_files->setEnabled(true);
-    }
+    // Enable the recent files menu if the list isn't empty
+    ui.menu_recent_files->setEnabled(num_recent_files != 0);
 }
 
 void GMainWindow::OnGameListLoadFile(QString game_path) {
@@ -1011,9 +1030,8 @@ void GMainWindow::OnMenuRecentFile() {
     QAction* action = qobject_cast<QAction*>(sender());
     assert(action);
 
-    QString filename = action->data().toString();
-    QFileInfo file_info(filename);
-    if (file_info.exists()) {
+    const QString filename = action->data().toString();
+    if (QFileInfo::exists(filename)) {
         BootGame(filename);
     } else {
         // Display an error message and remove the file from the list.
@@ -1383,15 +1401,14 @@ void GMainWindow::UpdateUITheme() {
     QStringList theme_paths(default_theme_paths);
     if (UISettings::values.theme != UISettings::themes[0].second &&
         !UISettings::values.theme.isEmpty()) {
-        QString theme_uri(":" + UISettings::values.theme + "/style.qss");
+        const QString theme_uri(":" + UISettings::values.theme + "/style.qss");
         QFile f(theme_uri);
-        if (!f.exists()) {
-            LOG_ERROR(Frontend, "Unable to set style, stylesheet file not found");
-        } else {
-            f.open(QFile::ReadOnly | QFile::Text);
+        if (f.open(QFile::ReadOnly | QFile::Text)) {
             QTextStream ts(&f);
             qApp->setStyleSheet(ts.readAll());
             GMainWindow::setStyleSheet(ts.readAll());
+        } else {
+            LOG_ERROR(Frontend, "Unable to set style, stylesheet file not found");
         }
         theme_paths.append(QStringList{":/icons/default", ":/icons/" + UISettings::values.theme});
         QIcon::setThemeName(":/icons/" + UISettings::values.theme);

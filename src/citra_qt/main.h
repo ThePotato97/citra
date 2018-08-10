@@ -28,6 +28,7 @@ class GraphicsBreakPointsWidget;
 class GraphicsTracingWidget;
 class GraphicsVertexShaderWidget;
 class GRenderWindow;
+class LLEServiceModulesWidget;
 class MicroProfileDialog;
 class MultiplayerState;
 class ProfilerWidget;
@@ -205,6 +206,8 @@ private:
     std::unique_ptr<EmuThread> emu_thread;
     // The title of the game currently running
     QString game_title;
+    // The path to the game currently running
+    QString game_path;
 
     // Debugger panes
     ProfilerWidget* profilerWidget;
@@ -215,6 +218,7 @@ private:
     GraphicsBreakPointsWidget* graphicsBreakpointsWidget;
     GraphicsVertexShaderWidget* graphicsVertexShaderWidget;
     GraphicsTracingWidget* graphicsTracingWidget;
+    LLEServiceModulesWidget* lleServiceModulesWidget;
     WaitTreeWidget* waitTreeWidget;
     Updater* updater;
 
